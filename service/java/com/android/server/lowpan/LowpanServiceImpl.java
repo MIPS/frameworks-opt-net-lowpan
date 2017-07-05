@@ -32,7 +32,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-
 /**
  * LowpanService handles remote LoWPAN operation requests by implementing the ILowpanManager
  * interface.
@@ -173,7 +172,7 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
         synchronized (mInterfaceMap) {
             previous = mInterfaceMap.get(name);
 
-            agent = new LowpanInterfaceTracker(lowpanInterface, mContext, getLooper());
+            agent = new LowpanInterfaceTracker(mContext, lowpanInterface, getLooper());
 
             mInterfaceMap.put(name, agent);
         }

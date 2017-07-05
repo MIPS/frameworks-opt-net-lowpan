@@ -19,33 +19,31 @@ package com.android.server.lowpan;
 import android.annotation.NonNull;
 import android.content.Context;
 import android.net.ConnectivityManager;
+import android.net.IpPrefix;
+import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.NetworkAgent;
 import android.net.NetworkCapabilities;
 import android.net.NetworkFactory;
 import android.net.NetworkInfo;
 import android.net.NetworkInfo.DetailedState;
+import android.net.ip.IpManager;
+import android.net.ip.IpManager.ProvisioningConfiguration;
 import android.net.lowpan.ILowpanInterface;
 import android.net.lowpan.LowpanException;
 import android.net.lowpan.LowpanInterface;
 import android.net.lowpan.LowpanProperties;
-import android.os.IBinder;
-import android.os.INetworkManagementService;
 import android.os.Looper;
 import android.os.Message;
-import android.os.RemoteException;
-import android.os.ServiceManager;
 import android.util.Log;
 import com.android.internal.util.HexDump;
 import com.android.internal.util.Protocol;
 import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
-import com.android.server.net.NetlinkTracker;
 
 /** Tracks connectivity of a LoWPAN interface. */
 class LowpanInterfaceTracker extends StateMachine {
 
-    ////////////////////////////////////////////////////////////////////////////
     // Misc Constants
 
     /** Network type string for NetworkInfo */
@@ -67,7 +65,6 @@ class LowpanInterfaceTracker extends StateMachine {
     /** Number of state machine log records. */
     public static final short NUM_LOG_RECS_NORMAL = 100;
 
-    ////////////////////////////////////////////////////////////////////////////
     // Message Code Enumeration Constants
 
     /** The base for LoWPAN message codes */
@@ -80,18 +77,18 @@ class LowpanInterfaceTracker extends StateMachine {
     static final int CMD_STATE_CHANGE = BASE + 5;
     static final int CMD_LINK_PROPERTIES_CHANGE = BASE + 6;
     static final int CMD_UNWANTED = BASE + 7;
+    static final int CMD_PROVISIONING_SUCCESS = BASE + 8;
+    static final int CMD_PROVISIONING_FAILURE = BASE + 9;
 
-    ////////////////////////////////////////////////////////////////////////////
     // Services and interfaces
 
     ILowpanInterface mILowpanInterface;
     private LowpanInterface mLowpanInterface;
     private NetworkAgent mNetworkAgent;
     private NetworkFactory mNetworkFactory;
-    private INetworkManagementService mNmService;
-    private final NetlinkTracker mNetlinkTracker;
+    private final IpManager mIpManager;
+    private final IpManager.Callback mIpManagerCallback = new IpManagerCallback();
 
-    ////////////////////////////////////////////////////////////////////////////
     // Instance Variables
 
     private String mInterfaceName;
@@ -102,7 +99,6 @@ class LowpanInterfaceTracker extends StateMachine {
     private final NetworkCapabilities mNetworkCapabilities = new NetworkCapabilities();
     private String mState = "";
 
-    ////////////////////////////////////////////////////////////////////////////
     // State machine state instances
 
     final DefaultState mDefaultState = new DefaultState();
@@ -112,14 +108,13 @@ class LowpanInterfaceTracker extends StateMachine {
     final CommissioningState mCommissioningState = new CommissioningState();
     final AttachingState mAttachingState = new AttachingState();
     final AttachedState mAttachedState = new AttachedState();
+    final ObtainingIpState mObtainingIpState = new ObtainingIpState();
     final FaultState mFaultState = new FaultState();
     final ConnectedState mConnectedState = new ConnectedState();
 
-    ////////////////////////////////////////////////////////////////////////////
 
     private LocalLowpanCallback mLocalLowpanCallback = new LocalLowpanCallback();
 
-    ////////////////////////////////////////////////////////////////////////////
     // Misc Private Classes
 
     private class LocalLowpanCallback extends LowpanInterface.Callback {
@@ -138,7 +133,23 @@ class LowpanInterfaceTracker extends StateMachine {
         }
     }
 
-    ////////////////////////////////////////////////////////////////////////////
+    class IpManagerCallback extends IpManager.Callback {
+        @Override
+        public void onProvisioningSuccess(LinkProperties newLp) {
+            LowpanInterfaceTracker.this.sendMessage(CMD_PROVISIONING_SUCCESS, newLp);
+        }
+
+        @Override
+        public void onProvisioningFailure(LinkProperties newLp) {
+            LowpanInterfaceTracker.this.sendMessage(CMD_PROVISIONING_FAILURE, newLp);
+        }
+
+        @Override
+        public void onLinkPropertiesChange(LinkProperties newLp) {
+            LowpanInterfaceTracker.this.sendMessage(CMD_LINK_PROPERTIES_CHANGE, newLp);
+        }
+    }
+
     // State Definitions
 
     class InitState extends State {
@@ -174,18 +185,6 @@ class LowpanInterfaceTracker extends StateMachine {
 
             mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_NONE, 0, NETWORK_TYPE, "");
             mNetworkInfo.setIsAvailable(true);
-
-            if (mNmService == null) {
-                IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
-                mNmService = INetworkManagementService.Stub.asInterface(b);
-            }
-
-            // Start tracking interface change events.
-            try {
-                mNmService.registerObserver(mNetlinkTracker);
-            } catch (RemoteException e) {
-                Log.e(TAG, "Could not register InterfaceObserver " + e);
-            }
 
             mLowpanInterface.registerCallback(mLocalLowpanCallback);
 
@@ -239,7 +238,7 @@ class LowpanInterfaceTracker extends StateMachine {
                                 transitionTo(mAttachingState);
                                 break;
                             case LowpanInterface.STATE_ATTACHED:
-                                transitionTo(mConnectedState);
+                                transitionTo(mObtainingIpState);
                                 break;
                             case LowpanInterface.STATE_FAULT:
                                 transitionTo(mFaultState);
@@ -254,12 +253,6 @@ class LowpanInterfaceTracker extends StateMachine {
 
         @Override
         public void exit() {
-
-            try {
-                mNmService.unregisterObserver(mNetlinkTracker);
-            } catch (RemoteException x) {
-                Log.e(TAG, x.toString());
-            }
 
             mLowpanInterface.unregisterCallback(mLocalLowpanCallback);
         }
@@ -285,14 +278,6 @@ class LowpanInterfaceTracker extends StateMachine {
                 }
             }
 
-            try {
-                mNmService.enableIpv6(mInterfaceName);
-            } catch (RemoteException x) {
-                Log.e(
-                        TAG,
-                        "Failed trying to enable IPv6 on " + mInterfaceName + ": " + x.toString());
-            }
-
             mNetworkFactory.register();
         }
 
@@ -304,16 +289,14 @@ class LowpanInterfaceTracker extends StateMachine {
                         if (DBG) {
                             Log.i(TAG, "UNWANTED.");
                         }
+
                         // TODO: Figure out how to properly handle this.
-                        try {
-                            mLowpanInterface.leave();
-                        } catch (LowpanException x) {
-                            Log.e(TAG, x.toString());
-                        }
+
                         shutdownNetworkAgent();
                     }
                     break;
 
+                case CMD_PROVISIONING_SUCCESS:
                 case CMD_LINK_PROPERTIES_CHANGE:
                     mLinkProperties = (LinkProperties) message.obj;
                     if (DBG) {
@@ -322,6 +305,10 @@ class LowpanInterfaceTracker extends StateMachine {
                     if (mNetworkAgent != null) {
                         mNetworkAgent.sendLinkProperties(mLinkProperties);
                     }
+                    break;
+
+                case CMD_PROVISIONING_FAILURE:
+                    Log.i(TAG, "Provisioning Failure: " + message.obj.toString());
                     break;
             }
 
@@ -367,14 +354,6 @@ class LowpanInterfaceTracker extends StateMachine {
     class AttachingState extends State {
         @Override
         public void enter() {
-            try {
-                mNmService.enableIpv6(mInterfaceName);
-            } catch (RemoteException x) {
-                Log.e(
-                        TAG,
-                        "Failed trying to enable IPv6 on " + mInterfaceName + ": " + x.toString());
-            }
-
             mNetworkInfo.setDetailedState(DetailedState.CONNECTING, null, mHwAddr);
             mNetworkInfo.setIsAvailable(true);
             bringUpNetworkAgent();
@@ -393,6 +372,7 @@ class LowpanInterfaceTracker extends StateMachine {
     class AttachedState extends State {
         @Override
         public void enter() {
+            bringUpNetworkAgent();
             mNetworkInfo.setIsAvailable(true);
         }
 
@@ -419,18 +399,44 @@ class LowpanInterfaceTracker extends StateMachine {
         }
     }
 
+    class ObtainingIpState extends State {
+        @Override
+        public void enter() {
+            mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
+            mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+
+
+            final ProvisioningConfiguration provisioningConfiguration =
+                    mIpManager
+                            .buildProvisioningConfiguration()
+                            .withProvisioningTimeoutMs(0)
+                            .withoutIpReachabilityMonitor()
+                            .withoutIPv4()
+                            .build();
+
+            mIpManager.startProvisioning(provisioningConfiguration);
+        }
+
+        @Override
+        public boolean processMessage(Message message) {
+
+            switch (message.what) {
+                case CMD_PROVISIONING_SUCCESS:
+                    Log.i(TAG, "Provisioning Success: " + message.obj.toString());
+                    transitionTo(mConnectedState);
+                    break;
+            }
+            return NOT_HANDLED;
+        }
+
+        @Override
+        public void exit() {}
+    }
+
     class ConnectedState extends State {
         @Override
         public void enter() {
             mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
-
-            synchronized (mNetlinkTracker) {
-                mLinkProperties = mNetlinkTracker.getLinkProperties();
-            }
-
-            bringUpNetworkAgent();
-
-            mNetworkAgent.sendLinkProperties(mLinkProperties);
             mNetworkAgent.sendNetworkInfo(mNetworkInfo);
             mNetworkAgent.sendNetworkScore(NETWORK_SCORE);
         }
@@ -461,10 +467,7 @@ class LowpanInterfaceTracker extends StateMachine {
         public void exit() {}
     }
 
-    ////////////////////////////////////////////////////////////////////////////
-
-    public LowpanInterfaceTracker(
-            ILowpanInterface lowpanInterface, Context context, Looper looper) {
+    public LowpanInterfaceTracker(Context context, ILowpanInterface ifaceService, Looper looper) {
         super(TAG, looper);
 
         if (DBG) {
@@ -475,18 +478,14 @@ class LowpanInterfaceTracker extends StateMachine {
         setLogRecSize(NUM_LOG_RECS_NORMAL);
         setLogOnlyTransitions(false);
 
-        mILowpanInterface = lowpanInterface;
-        mLowpanInterface = LowpanInterface.from(mILowpanInterface);
+        mILowpanInterface = ifaceService;
+        mLowpanInterface = new LowpanInterface(context, ifaceService, looper);
         mContext = context;
 
         mInterfaceName = mLowpanInterface.getName();
 
         mLinkProperties = new LinkProperties();
         mLinkProperties.setInterfaceName(mInterfaceName);
-
-        mNmService =
-                INetworkManagementService.Stub.asInterface(
-                        ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE));
 
         // Initialize capabilities
         mNetworkCapabilities.addTransportType(NetworkCapabilities.TRANSPORT_LOWPAN);
@@ -495,7 +494,7 @@ class LowpanInterfaceTracker extends StateMachine {
         mNetworkCapabilities.setLinkDownstreamBandwidthKbps(100);
 
         // Things don't seem to work properly without this. TODO: Investigate.
-        mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        //mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mInitState);
@@ -506,6 +505,7 @@ class LowpanInterfaceTracker extends StateMachine {
         addState(mCommissioningState, mNormalState);
         addState(mAttachingState, mNormalState);
         addState(mAttachedState, mNormalState);
+        addState(mObtainingIpState, mAttachedState);
         addState(mConnectedState, mAttachedState);
         // CHECKSTYLE:ON IndentationCheck
 
@@ -524,19 +524,7 @@ class LowpanInterfaceTracker extends StateMachine {
                     }
                 };
 
-        mNetlinkTracker =
-                new NetlinkTracker(
-                        mInterfaceName,
-                        new NetlinkTracker.Callback() {
-                            @Override
-                            public void update() {
-                                synchronized (mNetlinkTracker) {
-                                    sendMessage(
-                                            CMD_LINK_PROPERTIES_CHANGE,
-                                            mNetlinkTracker.getLinkProperties());
-                                }
-                            }
-                        });
+        mIpManager = new IpManager(mContext, mInterfaceName, mIpManagerCallback);
 
         start();
 
