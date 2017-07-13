@@ -32,9 +32,11 @@ import android.net.ip.IpManager.ProvisioningConfiguration;
 import android.net.lowpan.ILowpanInterface;
 import android.net.lowpan.LowpanException;
 import android.net.lowpan.LowpanInterface;
-import android.net.lowpan.LowpanProperties;
+import android.net.lowpan.LowpanRuntimeException;
 import android.os.Looper;
 import android.os.Message;
+import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.util.Log;
 import com.android.internal.util.HexDump;
 import com.android.internal.util.Protocol;
@@ -111,7 +113,6 @@ class LowpanInterfaceTracker extends StateMachine {
     final ObtainingIpState mObtainingIpState = new ObtainingIpState();
     final FaultState mFaultState = new FaultState();
     final ConnectedState mConnectedState = new ConnectedState();
-
 
     private LocalLowpanCallback mLocalLowpanCallback = new LocalLowpanCallback();
 
@@ -268,9 +269,13 @@ class LowpanInterfaceTracker extends StateMachine {
             if (mHwAddr == null) {
                 byte[] hwAddr = null;
                 try {
-                    hwAddr = mLowpanInterface.getProperty(LowpanProperties.KEY_MAC_ADDRESS);
-                } catch (LowpanException x) {
+                    hwAddr = mLowpanInterface.getService().getMacAddress();
+
+                } catch (RemoteException | ServiceSpecificException x) {
+                    // Don't let misbehavior of an interface service
+                    // crash the system service.
                     Log.e(TAG, x.toString());
+                    transitionTo(mFaultState);
                 }
 
                 if (hwAddr != null) {
@@ -296,7 +301,6 @@ class LowpanInterfaceTracker extends StateMachine {
                     }
                     break;
 
-                case CMD_PROVISIONING_SUCCESS:
                 case CMD_LINK_PROPERTIES_CHANGE:
                     mLinkProperties = (LinkProperties) message.obj;
                     if (DBG) {
@@ -424,7 +428,7 @@ class LowpanInterfaceTracker extends StateMachine {
                 case CMD_PROVISIONING_SUCCESS:
                     Log.i(TAG, "Provisioning Success: " + message.obj.toString());
                     transitionTo(mConnectedState);
-                    break;
+                    return HANDLED;
             }
             return NOT_HANDLED;
         }
@@ -492,9 +496,6 @@ class LowpanInterfaceTracker extends StateMachine {
         mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
         mNetworkCapabilities.setLinkUpstreamBandwidthKbps(100);
         mNetworkCapabilities.setLinkDownstreamBandwidthKbps(100);
-
-        // Things don't seem to work properly without this. TODO: Investigate.
-        //mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mInitState);
