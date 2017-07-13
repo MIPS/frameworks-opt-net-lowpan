@@ -26,7 +26,7 @@ import android.net.lowpan.LowpanInterface;
 import android.net.lowpan.LowpanManager;
 import android.net.lowpan.LowpanProvision;
 import android.net.lowpan.LowpanScanner;
-import android.os.IBinder;
+import android.net.LinkAddress;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
 import android.util.AndroidRuntimeException;
@@ -57,18 +57,35 @@ public class LowpanCtl extends BaseCommand {
     public void onShowUsage(PrintStream out) {
         out.println(
                 "usage: lowpanctl [options] [subcommand] [subcommand-options]\n"
+                        + "options:\n"
+                        + "       -I / --interface <iface-name> ..... Interface Name\n"
+                        + "subcommands:\n"
                         + "       lowpanctl status\n"
                         + "       lowpanctl form\n"
                         + "       lowpanctl join\n"
+                        + "       lowpanctl attach\n"
                         + "       lowpanctl leave\n"
-                        + "       lowpanctl up\n"
-                        + "       lowpanctl down\n"
-                        + "       lowpanctl get [property-name]\n"
-                        + "       lowpanctl set [property-name]\n"
+                        + "       lowpanctl enable\n"
+                        + "       lowpanctl disable\n"
+                        + "       lowpanctl show-credential\n"
                         + "       lowpanctl scan\n"
                         + "       lowpanctl reset\n"
                         + "       lowpanctl list\n"
+                        + "\n"
+                        + "usage: lowpanctl [options] join/form/attach [network-name]\n"
+                        + "subcommand-options:\n"
+                        + "       --name <network-name> ............. Network Name\n"
+                        + "       -p / --panid <panid> .............. PANID\n"
+                        + "       -c / --channel <channel> .......... Channel Index\n"
+                        + "       -x / --xpanid <xpanid> ............ XPANID\n"
+                        + "       -k / --master-key <master-key> .... Master Key\n"
+                        + "       --master-key-index <key-index> .... Key Index\n"
+                        + "\n"
+                        + "usage: lowpanctl [options] show-credential\n"
+                        + "subcommand-options:\n"
+                        + "       -r / --raw ........................ Print only key contents\n"
                         + "\n");
+
     }
 
     private class CommandErrorException extends AndroidRuntimeException {
@@ -129,11 +146,17 @@ public class LowpanCtl extends BaseCommand {
                 } else if (op.equals("scan") || op.equals("netscan") || op.equals("ns")) {
                     runNetScan();
                     break;
-                } else if (op.equals("attach") || op.equals("up")) {
+                } else if (op.equals("attach")) {
                     runAttach();
                     break;
-                } else if (op.equals("detach") || op.equals("down")) {
-                    runDetach();
+                } else if (op.equals("enable")) {
+                    runEnable();
+                    break;
+                } else if (op.equals("disable")) {
+                    runDisable();
+                    break;
+                } else if (op.equals("show-credential")) {
+                    runShowCredential();
                     break;
                 } else if (op.equals("join")) {
                     runJoin();
@@ -143,12 +166,6 @@ public class LowpanCtl extends BaseCommand {
                     break;
                 } else if (op.equals("leave")) {
                     runLeave();
-                    break;
-                } else if (op.equals("get") || op.equals("getprop")) {
-                    runGetProp();
-                    break;
-                } else if (op.equals("set") || op.equals("setprop")) {
-                    runSetProp();
                     break;
                 } else if (op.equals("energyscan") || op.equals("energy") || op.equals("es")) {
                     runEnergyScan();
@@ -176,6 +193,14 @@ public class LowpanCtl extends BaseCommand {
         getLowpanInterface().reset();
     }
 
+    private void runEnable() throws LowpanException {
+        getLowpanInterface().setEnabled(true);
+    }
+
+    private void runDisable() throws LowpanException {
+        getLowpanInterface().setEnabled(false);
+    }
+
     private LowpanProvision getProvisionFromArgs(boolean credentialRequired) {
         LowpanProvision.Builder builder = new LowpanProvision.Builder();
         Map<String, Object> properties = new HashMap();
@@ -200,6 +225,8 @@ public class LowpanCtl extends BaseCommand {
                 masterKey = HexDump.hexStringToByteArray(nextArgRequired());
             } else if (arg.equals("--master-key-index")) {
                 masterKeyIndex = Integer.decode(nextArgRequired());
+            } else if (arg.equals("--help")) {
+                throwCommandError("");
             } else if (arg.startsWith("-") || hasName) {
                 throwCommandError("Unrecognized argument \"" + arg + "\"");
             } else {
@@ -237,10 +264,6 @@ public class LowpanCtl extends BaseCommand {
         System.out.println("Attached.");
     }
 
-    private void runDetach() throws LowpanException {
-        getLowpanInterface().setUp(false);
-    }
-
     private void runLeave() throws LowpanException {
         getLowpanInterface().leave();
     }
@@ -262,10 +285,10 @@ public class LowpanCtl extends BaseCommand {
         if (provision.getLowpanCredential() != null) {
             System.out.println(
                     "Forming "
-                            + provision.getLowpanIdentity().toString()
+                            + provision.getLowpanIdentity()
                             + " with provided credential");
         } else {
-            System.out.println("Forming " + provision.getLowpanIdentity().toString());
+            System.out.println("Forming " + provision.getLowpanIdentity());
         }
 
         getLowpanInterface().form(provision);
@@ -273,91 +296,56 @@ public class LowpanCtl extends BaseCommand {
         System.out.println("Formed.");
     }
 
-    private String propAsString(String key, Object value) {
-        if (value instanceof byte[]) {
-            value = HexDump.toHexString((byte[]) value);
-        } else if (value instanceof String[]) {
-            if (((String[]) value).length == 0) {
-                value = "{ }";
-            } else {
-                String renderedValue = "{\n";
-                for (String row : (String[]) value) {
-                    renderedValue += "\t\"" + row + "\"\n";
-                }
-                value = renderedValue + "}";
-            }
-        } else if (value instanceof int[]) {
-            if (((int[]) value).length == 0) {
-                value = "{ }";
-            } else {
-                String renderedValue = "{\n";
-                for (int row : (int[]) value) {
-                    renderedValue += "\t" + Integer.toString(row) + "\n";
-                }
-                value = renderedValue + "}";
-            }
-        } else if ((value instanceof Long) && (key.equals(ILowpanInterface.KEY_NETWORK_XPANID))) {
-            value = "0x" + Long.toHexString((Long) value);
-        } else if ((value instanceof Integer)
-                && (key.equals(ILowpanInterface.KEY_NETWORK_PANID)
-                        || key.equals("Thread:RLOC16"))) {
-            value = String.format("0x%04X", (Integer) value & 0xFFFF);
-        }
-        return value.toString();
-    }
-
-    private void runGetProp() throws LowpanException, RemoteException {
-        String key = nextArg();
-
-        if (key == null) {
-            try {
-                String key_list[] = getILowpanInterface().getPropertyKeys();
-
-                for (String subkey : key_list) {
-                    Object value;
-                    try {
-                        value = getILowpanInterface().getPropertyAsString(subkey);
-                    } catch (Exception x) {
-                        value = x;
-                    }
-                    System.out.println(subkey + " => " + propAsString(subkey, value));
-                }
-            } catch (RemoteException x) {
-                x.rethrowAsRuntimeException();
-            }
-        } else {
-            Object value = getILowpanInterface().getPropertyAsString(key);
-            System.out.println(propAsString(key, value));
-        }
-    }
-
-    private void runSetProp() {
-        System.out.println("Command not implemented");
-    }
-
     private void runStatus() throws LowpanException, RemoteException {
-        String statusKeys[] = {
-            ILowpanInterface.KEY_INTERFACE_ENABLED,
-            ILowpanInterface.KEY_INTERFACE_STATE,
-            "org.wpantund.Daemon:Version",
-            "org.wpantund.NCP:Version",
-            "org.wpantund.Config:NCP:DriverName",
-            "org.wpantund.IPv6:LinkLocalAddress",
-            "org.wpantund.IPv6:MeshLocalAddress",
-        };
-        System.out.println(
-                "Current Network => " + getLowpanInterface().getLowpanIdentity().toString());
+        LowpanInterface iface = getLowpanInterface();
+        StringBuffer sb = new StringBuffer();
 
-        for (String key : statusKeys) {
-            Object value;
-            try {
-                value = getILowpanInterface().getPropertyAsString(key);
-                if (value != null) {
-                    System.out.println(key + " => " + propAsString(key, value));
-                }
-            } catch (ServiceSpecificException x) {
-                // Skip keys which cause remote exceptions.
+        sb.append(iface.getName())
+                .append("\t")
+                .append(iface.getState() + " (" + iface.getRole() + ")");
+
+        if (iface.isUp()) {
+            sb.append(" UP");
+        }
+
+        if (iface.isConnected()) {
+            sb.append(" CONNECTED");
+        }
+
+        if (iface.isCommissioned()) {
+            sb.append(" COMMISSIONED");
+        }
+
+        sb
+            .append("\n\t")
+            .append(getLowpanInterface().getLowpanIdentity());
+
+        for (LinkAddress addr : iface.getLinkAddresses()) {
+            sb.append("\n\t").append(addr);
+        }
+
+        sb.append("\n");
+        System.out.println(sb.toString());
+    }
+
+    private void runShowCredential() throws LowpanException, RemoteException {
+        LowpanInterface iface = getLowpanInterface();
+        boolean raw = false;
+        String arg;
+        while ((arg = nextArg()) != null) {
+            if (arg.equals("--raw") || arg.equals("-r")) {
+                raw = true;
+            } else {
+                throwCommandError("Unrecognized argument \"" + arg + "\"");
             }
+        }
+
+        LowpanCredential credential = iface.getLowpanCredential();
+        if (raw) {
+            System.out.println(HexDump.toHexString(credential.getMasterKey()));
+        } else {
+            System.out.println(
+                iface.getName() + "\t" + credential.toSensitiveString());
         }
     }
 
