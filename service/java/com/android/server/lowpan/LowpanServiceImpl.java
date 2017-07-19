@@ -25,6 +25,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.util.Log;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -111,9 +112,12 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
             for (ILowpanManagerListener listener : mListenerSet) {
                 try {
                     listener.onInterfaceRemoved(lowpanInterface);
-                } catch (RemoteException x) {
-                    // Just skip.
+                } catch (RemoteException | ServiceSpecificException x) {
+                    // Don't let misbehavior of a listener
+                    // crash the system service.
                     Log.e(TAG, "Exception caught: " + x);
+
+                    // TODO: Consider removing the listener...?
                 }
             }
         }
@@ -125,9 +129,12 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
             for (ILowpanManagerListener listener : mListenerSet) {
                 try {
                     listener.onInterfaceAdded(lowpanInterface);
-                } catch (RemoteException x) {
-                    // Just skip.
+                } catch (RemoteException | ServiceSpecificException x) {
+                    // Don't let misbehavior of a listener
+                    // crash the system service.
                     Log.e(TAG, "Exception caught: " + x);
+
+                    // TODO: Consider removing the listener...?
                 }
             }
         }
@@ -161,7 +168,9 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
                             },
                             0);
 
-        } catch (RemoteException x) {
+        } catch (RemoteException | ServiceSpecificException x) {
+            // Don't let misbehavior of an interface
+            // crash the system service.
             Log.e(TAG, "Exception caught: " + x);
             return;
         }
@@ -224,7 +233,7 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
 
         try {
             name = lowpanInterface.getName();
-        } catch (RemoteException x) {
+        } catch (RemoteException | ServiceSpecificException x) {
             // Directly fetching the name failed, so fall back to
             // a reverse lookup.
             synchronized (mInterfaceMap) {
@@ -258,6 +267,7 @@ public class LowpanServiceImpl extends ILowpanManager.Stub {
                                     0);
                     mListenerSet.add(listener);
                 } catch (RemoteException x) {
+                    // We only get this exception if listener has already died.
                     Log.e(TAG, "Exception caught: " + x);
                 }
             }

@@ -28,13 +28,16 @@ import android.net.NetworkFactory;
 import android.net.NetworkInfo;
 import android.net.NetworkInfo.DetailedState;
 import android.net.ip.IpManager;
+import android.net.ip.IpManager.InitialConfiguration;
 import android.net.ip.IpManager.ProvisioningConfiguration;
 import android.net.lowpan.ILowpanInterface;
 import android.net.lowpan.LowpanException;
 import android.net.lowpan.LowpanInterface;
-import android.net.lowpan.LowpanProperties;
+import android.net.lowpan.LowpanRuntimeException;
 import android.os.Looper;
 import android.os.Message;
+import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.util.Log;
 import com.android.internal.util.HexDump;
 import com.android.internal.util.Protocol;
@@ -111,7 +114,6 @@ class LowpanInterfaceTracker extends StateMachine {
     final ObtainingIpState mObtainingIpState = new ObtainingIpState();
     final FaultState mFaultState = new FaultState();
     final ConnectedState mConnectedState = new ConnectedState();
-
 
     private LocalLowpanCallback mLocalLowpanCallback = new LocalLowpanCallback();
 
@@ -268,9 +270,13 @@ class LowpanInterfaceTracker extends StateMachine {
             if (mHwAddr == null) {
                 byte[] hwAddr = null;
                 try {
-                    hwAddr = mLowpanInterface.getProperty(LowpanProperties.KEY_MAC_ADDRESS);
-                } catch (LowpanException x) {
+                    hwAddr = mLowpanInterface.getService().getMacAddress();
+
+                } catch (RemoteException | ServiceSpecificException x) {
+                    // Don't let misbehavior of an interface service
+                    // crash the system service.
                     Log.e(TAG, x.toString());
+                    transitionTo(mFaultState);
                 }
 
                 if (hwAddr != null) {
@@ -296,7 +302,6 @@ class LowpanInterfaceTracker extends StateMachine {
                     }
                     break;
 
-                case CMD_PROVISIONING_SUCCESS:
                 case CMD_LINK_PROPERTIES_CHANGE:
                     mLinkProperties = (LinkProperties) message.obj;
                     if (DBG) {
@@ -402,19 +407,75 @@ class LowpanInterfaceTracker extends StateMachine {
     class ObtainingIpState extends State {
         @Override
         public void enter() {
+            InitialConfiguration initialConfiguration = new InitialConfiguration();
+
+            try {
+                for (LinkAddress address : mLowpanInterface.getLinkAddresses()) {
+                    if (DBG) {
+                        Log.i(TAG, "Adding link address: " + address);
+                    }
+
+                    initialConfiguration.ipAddresses.add(address);
+
+                    IpPrefix prefix = new IpPrefix(address.getAddress(), address.getPrefixLength());
+
+                    initialConfiguration.directlyConnectedRoutes.add(prefix);
+                }
+
+                for (IpPrefix prefix : mLowpanInterface.getLinkNetworks()) {
+                    if (DBG) {
+                        Log.i(TAG, "Adding directly connected route: " + prefix);
+                    }
+
+                    initialConfiguration.directlyConnectedRoutes.add(prefix);
+                }
+
+            } catch (LowpanException | LowpanRuntimeException x) {
+                Log.e(TAG, "Exception while populating InitialConfiguration: " + x);
+                transitionTo(mFaultState);
+                return;
+
+            } catch (RuntimeException x) {
+                if (x.getCause() instanceof RemoteException) {
+                    // Don't let misbehavior of an interface service
+                    // crash the system service.
+                    Log.e(TAG, x.toString());
+                    transitionTo(mFaultState);
+
+                } else {
+                    // This exception wasn't remote in origin, so we rethrow.
+                    throw x;
+                }
+            }
+
+            if (!initialConfiguration.isValid()) {
+                Log.e(TAG, "Invalid initial configuration: " + initialConfiguration);
+                transitionTo(mFaultState);
+                return;
+            }
+
+            if (DBG) {
+                Log.d(TAG, "Using Initial configuration: " + initialConfiguration);
+            }
+
+            final ProvisioningConfiguration.Builder builder =
+                    mIpManager.buildProvisioningConfiguration();
+
+            builder.withInitialConfiguration(initialConfiguration).withProvisioningTimeoutMs(0);
+
+            // LoWPAN networks generally don't have internet connectivity,
+            // so the reachability monitor would almost always fail.
+            builder.withoutIpReachabilityMonitor();
+
+            // We currently only support IPv6 on LoWPAN networks, although
+            // theoretically we could make this determination by examining
+            // the InitialConfiguration for any IPv4 addresses.
+            builder.withoutIPv4();
+
+            mIpManager.startProvisioning(builder.build());
+
             mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
             mNetworkAgent.sendNetworkInfo(mNetworkInfo);
-
-
-            final ProvisioningConfiguration provisioningConfiguration =
-                    mIpManager
-                            .buildProvisioningConfiguration()
-                            .withProvisioningTimeoutMs(0)
-                            .withoutIpReachabilityMonitor()
-                            .withoutIPv4()
-                            .build();
-
-            mIpManager.startProvisioning(provisioningConfiguration);
         }
 
         @Override
@@ -424,7 +485,7 @@ class LowpanInterfaceTracker extends StateMachine {
                 case CMD_PROVISIONING_SUCCESS:
                     Log.i(TAG, "Provisioning Success: " + message.obj.toString());
                     transitionTo(mConnectedState);
-                    break;
+                    return HANDLED;
             }
             return NOT_HANDLED;
         }
@@ -492,9 +553,6 @@ class LowpanInterfaceTracker extends StateMachine {
         mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
         mNetworkCapabilities.setLinkUpstreamBandwidthKbps(100);
         mNetworkCapabilities.setLinkDownstreamBandwidthKbps(100);
-
-        // Things don't seem to work properly without this. TODO: Investigate.
-        //mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mInitState);
