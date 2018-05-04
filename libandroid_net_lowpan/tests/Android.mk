@@ -63,7 +63,6 @@ LOCAL_JNI_SHARED_LIBRARIES += \
     libnativehelper \
     libnetdaidl \
     libui \
-    libunwind \
     libutils \
     libvndksupport \
     libcrypto \
